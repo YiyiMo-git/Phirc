@@ -1,0 +1,104 @@
+inner.rs
+
+# 敏感代码（凭据/登录/HYKB + 改谱 note_map）：本 mod 的实现细节，不随公开仓库分发。
+# 本地开发必须保留此目录；推公仓时整目录自然排除。若公仓也需编译，需另建 stub。
+/sensitive
+
+/target
+/assets/font.ttf
+# ⚠️ 但 `/assets/font.ttf` 已被 `git add -f` 强制入库（见下方说明），
+# 这里的忽略规则对它已不再生效 —— 保留是为了万一将来想取消跟踪。
+#
+# 【为什么必须强制入库】打歌界面字体 = 这份 font.ttf（`GAME_FONT`，见 prpr/src/core.rs）。
+# 它被 ignore 时，CI 编 APK/IPA 拿不到它，会走 android.yml 的兜底：
+#   ① 从官方 APK 提取  → 官方 Phira 的字体，不是这份
+#   ② 从 mivik.moe/prpr/font.ttf 下载 → 又是另一个字体
+# 结果就是 **PC 端字体正常、移动端字体不对**（因为 PC 用本地 assets/，CI 用兜底那份）。
+# 这个坑文档里记过一次（docs/美化改版方案.md §8.5.4，当时是 Ubuntu 字体混进来），
+# 现在直接把正确文件入库根治。
+# 正确文件：13,449,192 B，SHA256 DF8E56E323F6705DB27525560F0922C89DCBC8E75EA1686F9BCCAAD4432BD276
+# （与 Phi-Recorder-1.6.1/src-tauri/assets/font.ttf 逐字节相同）
+/cache
+/data
+/.cargo
+/config.txt
+/assets/background.jpg
+/assets/res
+/monitor-config.yml
+/.vscode
+
+/prpr-avc/static-lib
+
+# Mac
+
+._*
+.DS_Store
+/run_ios.sh
+/prebuild_ios.sh
+/build_ios.sh
+/build
+/*.ipa
+/phira.app
+/phira.xcodeproj/project.xcworkspace/xcuserdata/
+/xcode/LocalSigning.xcconfig
+/dist
+/project.yml
+/prpr.scent
+/.cargo
+
+# Test
+
+/test
+/log*
+/build_event_debug.sh
+
+
+# OHOS
+
+/phira/dist/
+
+# 内置默认资源包（Phigros 官方资源，不随仓库分发）
+assets/Phigros.zip
+
+# 本地构建产物 / 发布目录（含 exe 与历史备份，近 100MB，不入库）
+/rev
+/release
+/publish
+/dist-发布
+
+# 编译器崩溃转储（rustc ICE）
+/rustc-ice-*.txt
+
+# Android 本地 SDK 路径（含本机绝对路径）
+local.properties
+/android/local.properties
+/android/.gradle
+
+
+# ============================================================
+# 公开仓库排除：界面（WebView 层）与「上传成绩」功能
+# 本地开发保留这些文件；推到公开仓库时整块不带。
+# 注意：缺了这些文件，公开仓库**无法直接编译**（lib.rs/MainActivity 仍引用它们）。
+# ============================================================
+/phira/src/webui.rs
+/phira/ios/webview.m
+/android/app/src/main/java/org/flos/phira/modded/WebViewHost.java
+/launcher/ui
+/phira/ui
+/prpr/src/record.rs
+/webui_handoff.md
+/settings_webview_handoff.md
+/docs/rev
+/docs/上传成绩逆向笔记.md
+/docs/成绩上传实现文档.md
+/docs/score-upload-consent.md
+/docs/抓包指南.md
+/docs/ui-rewrite-prompt.md
+/docs/美化改版方案.md
+/respack_consolidated
+
+# 签名密钥库 / 本机路径（绝不公开）
+/android/keystore.jks
+/android/local.properties
+*.jks
+*.keystore

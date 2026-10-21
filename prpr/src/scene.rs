@@ -1,0 +1,749 @@
+//! Scene management module.
+#![allow(unused_macros)]
+
+prpr_l10n::tl_file!("scene" ttl);
+
+mod ending;
+pub use ending::{EndingScene, RecordUpdateState};
+
+mod game;
+pub use game::{
+    motion_level, motion_tilt, set_motion_level, set_motion_tilt, take_pending_offset, take_pending_volume, ChallengeEvent, GameMode, GameScene,
+    SimpleRecord,
+};
+
+mod loading;
+pub use loading::{BasicPlayer, LoadingScene, SaveFn, UpdateFn, UploadFn};
+
+use crate::{
+    ext::{draw_image, draw_parallelogram, screen_aspect, LocalTask, SafeTexture, ScaleType},
+    judge::Judge,
+    time::TimeManager,
+    ui::{BillBoard, Dialog, Message, MessageHandle, MessageKind, TextPainter, Ui},
+};
+use anyhow::{Error, Result};
+use cfg_if::cfg_if;
+use inputbox::{backend::Backend, InputBox, InputMode};
+use macroquad::prelude::*;
+use std::{
+    any::Any,
+    borrow::Cow,
+    cell::RefCell,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+};
+use tracing::warn;
+
+#[derive(Default)]
+pub enum NextScene {
+    #[default]
+    None,
+    Pop,
+    PopN(usize),
+    PopWithResult(Box<dyn Any>),
+    PopNWithResult(usize, Box<dyn Any>),
+    Exit,
+    Overlay(Box<dyn Scene>),
+    Replace(Box<dyn Scene>),
+}
+
+thread_local! {
+    pub static BILLBOARD: RefCell<(BillBoard, TimeManager)> = RefCell::new((BillBoard::new(), TimeManager::default()));
+    pub static DIALOG: RefCell<Option<Dialog>> = const { RefCell::new(None) };
+    pub static FULL_LOADING: RefCell<Option<FullLoadingView>> = const { RefCell::new(None) };
+}
+
+pub struct FullLoadingView {
+    keep_alive: Arc<()>,
+    text: Option<Cow<'static, str>>,
+}
+
+impl FullLoadingView {
+    pub fn begin() -> Arc<()> {
+        Self::begin_inner(None)
+    }
+    pub fn begin_text(text: Cow<'static, str>) -> Arc<()> {
+        Self::begin_inner(Some(text))
+    }
+    fn begin_inner(text: Option<Cow<'static, str>>) -> Arc<()> {
+        let arc = Arc::new(());
+        let ret = arc.clone();
+        FULL_LOADING.replace(Some(Self { keep_alive: arc, text }));
+        ret
+    }
+}
+
+#[inline]
+pub fn show_error(error: Error) {
+    warn!("show error: {error:?}");
+    Dialog::error(error).show();
+}
+
+pub struct MessageBuilder {
+    content: String,
+    kind: MessageKind,
+    duration: f32,
+}
+
+impl MessageBuilder {
+    pub fn new(content: String) -> Self {
+        Self {
+            content,
+            kind: MessageKind::Info,
+            duration: 2.,
+        }
+    }
+
+    #[inline]
+    pub fn kind(mut self, kind: MessageKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    #[inline]
+    pub fn duration(mut self, t: f32) -> Self {
+        self.duration = t;
+        self
+    }
+
+    #[inline]
+    pub fn ok(self) -> Self {
+        self.kind(MessageKind::Ok)
+    }
+
+    #[inline]
+    pub fn warn(self) -> Self {
+        self.kind(MessageKind::Warn)
+    }
+
+    #[inline]
+    pub fn error(self) -> Self {
+        self.kind(MessageKind::Error)
+    }
+
+    fn show(&mut self) -> MessageHandle {
+        BILLBOARD.with(|it| {
+            let mut guard = it.borrow_mut();
+            let (msg, handle) = Message::new(std::mem::take(&mut self.content), guard.1.now() as _, self.duration, self.kind.clone());
+            guard.0.add(msg);
+            handle
+        })
+    }
+
+    #[inline]
+    pub fn handle(mut self) -> MessageHandle {
+        let handle = self.show();
+        std::mem::forget(self);
+        handle
+    }
+}
+
+impl Drop for MessageBuilder {
+    fn drop(&mut self) {
+        self.show();
+    }
+}
+
+#[inline]
+pub fn show_message(msg: impl Into<String>) -> MessageBuilder {
+    MessageBuilder::new(msg.into())
+}
+
+pub static INPUT_TEXT: Mutex<(Option<String>, Option<String>)> = Mutex::new((None, None));
+/// Holds the id of the last input request the user cancelled (clicked Cancel or
+/// dismissed the dialog). Consumed via [`take_input_cancelled`]; distinct from
+/// [`INPUT_TEXT`] so callers can distinguish "cancelled" from "no input yet".
+pub static INPUT_CANCELLED: Mutex<Option<String>> = Mutex::new(None);
+#[cfg(not(target_arch = "wasm32"))]
+pub static CHOSEN_FILE: Mutex<(Option<String>, Option<String>)> = Mutex::new((None, None));
+
+/// 一次待处理的「文本输入」请求，内容是 [`InputBox`] 的 owned 版本。
+///
+/// # 为什么要有它
+///
+/// 以前 [`request_input`] 直接把配置丢给 `inputbox` 的原生对话框。Android 上那个
+/// `.aar` 打不开对话框时，会把失败提示串（例如 `can't open`）当成「用户输入的文本」
+/// 回调 `QuadNative.setInputText()`，脏字符串就这样进了配置
+/// （实测：`comboText` 被存成 `"COMBOcan't open "`）。
+///
+/// 所以现在**不再调那个库的对话框**：请求在这里落成纯数据，由游戏内自绘的输入框
+/// （`phira::ui::input_dialog`）渲染 / 编辑 / 收尾。
+#[derive(Clone, Debug, Default)]
+pub struct PendingInput {
+    /// 请求序号，每次 [`request_input`] 自增。
+    ///
+    /// 自绘输入框是**无状态**函数，靠这个序号判断「这是一次新请求」（同一个 id
+    /// 被连续请求两次时，光看 id 会把上一次的编辑缓冲留下来）。
+    pub seq: u64,
+    pub id: String,
+    pub title: String,
+    pub prompt: String,
+    pub default: String,
+    pub password: bool,
+    pub multiline: bool,
+    pub ok_label: String,
+    pub cancel_label: String,
+}
+
+/// 待处理输入请求的序号源（见 [`PendingInput::seq`]）。
+static NEXT_INPUT_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// 当前待处理的输入请求；没有请求时为 `None`。
+///
+/// 用 [`pending_input`] 读、[`finish_pending_input`] / [`cancel_pending_input`] 收尾。
+pub static PENDING_INPUT: Mutex<Option<PendingInput>> = Mutex::new(None);
+
+/// 已被自绘输入框取代，保留以便必要时回退：现在没有任何调用点。
+///
+/// 要回退到原生对话框：在 `request_input` 末尾恢复
+/// `show_inputbox(config, &*inputbox::backend::default_backend());`。
+#[allow(dead_code)]
+fn show_inputbox(config: InputBox, backend: &dyn Backend) {
+    let result = config.show_with_async(backend, |result| match result {
+        Ok(Some(text)) => {
+            INPUT_TEXT.lock().unwrap().1 = Some(text);
+        }
+        Ok(None) => {
+            // User cancelled; report it under the pending request's id so the
+            // caller can react (e.g. return to the previous screen).
+            let id = INPUT_TEXT.lock().unwrap().0.clone();
+            *INPUT_CANCELLED.lock().unwrap() = id;
+        }
+        Err(err) => {
+            warn!(?err, "failed to get input");
+        }
+    });
+    if let Err(err) = result {
+        warn!(?err, "failed to show input box");
+    }
+}
+
+#[inline]
+pub fn request_input(id: impl Into<String>, mut config: InputBox) {
+    let id: String = id.into();
+    // 语义保持不变：请求已发出、但还没有文本；`take_input()` 在确定前返回 `None`。
+    *INPUT_TEXT.lock().unwrap() = (Some(id.clone()), None);
+    *INPUT_CANCELLED.lock().unwrap() = None;
+    if config.title.is_none() {
+        config = config.title(ttl!("input"));
+    }
+    if config.prompt.is_none() {
+        config = config.prompt(ttl!("input-msg"));
+    }
+    if config.cancel_label.is_none() {
+        config = config.cancel_label(ttl!("cancel"));
+    }
+    if config.ok_label.is_none() {
+        config = config.ok_label(ttl!("confirm"));
+    }
+    // 不再调原生对话框（见 `PendingInput` 的说明），改成把配置转成 owned 数据，
+    // 交给游戏内自绘的输入框。
+    let pending = PendingInput {
+        seq: NEXT_INPUT_SEQ.fetch_add(1, Ordering::Relaxed),
+        id,
+        title: config.title.as_deref().unwrap_or_default().to_owned(),
+        prompt: config.prompt.as_deref().unwrap_or_default().to_owned(),
+        default: config.default.to_string(),
+        password: matches!(config.mode, InputMode::Password),
+        multiline: matches!(config.mode, InputMode::Multiline),
+        ok_label: config.ok_label.as_deref().unwrap_or_default().to_owned(),
+        cancel_label: config.cancel_label.as_deref().unwrap_or_default().to_owned(),
+    };
+    *PENDING_INPUT.lock().unwrap() = Some(pending);
+}
+
+/// 当前待处理的输入请求（克隆一份给渲染层用）。
+pub fn pending_input() -> Option<PendingInput> {
+    PENDING_INPUT.lock().unwrap().clone()
+}
+
+/// 是否有待处理的输入请求。
+///
+/// 给需要「模态拦截」的地方用（自绘输入框存在时不该让底下的页面 / 外壳继续响应触摸），
+/// 不做克隆，比 `pending_input().is_some()` 便宜。
+pub fn has_pending_input() -> bool {
+    PENDING_INPUT.lock().unwrap().is_some()
+}
+
+/// 自绘输入框的**绘制回调**，由上层（`phira`）在启动时注册一次。
+///
+/// 为什么必须挂在引擎层：引擎每帧**只渲染栈顶场景**，而输入请求可能来自任意场景
+/// （例如「谱面信息编辑」走的是 `SongScene`）。若只在某个上层页面的 `render` 里画
+/// 对话框，那些场景在栈顶时请求就表现为「**点了没反应**」。
+///
+/// 挂在 [`Main::render`] 的 `top_level` 分支里（和引擎自带 `DIALOG` 同一位置）
+/// 才能对所有场景生效。回调签名与 `phira` 的 `input_dialog::render` 一致。
+static INPUT_DIALOG_RENDERER: Mutex<Option<fn(&mut Ui, f32)>> = Mutex::new(None);
+
+/// 注册自绘输入框的绘制函数（`phira` 启动时调用一次，之后每帧由引擎调用）。
+pub fn set_input_dialog_renderer(f: fn(&mut Ui, f32)) {
+    *INPUT_DIALOG_RENDERER.lock().unwrap() = Some(f);
+}
+
+/// 自绘输入框点了「确定」：把文本交回给当初请求它的调用点。
+///
+/// `trim` 只去掉**首尾**空白（`str::trim` 的语义），多行输入内部的换行会原样保留。
+pub fn finish_pending_input(text: String) {
+    let pending = PENDING_INPUT.lock().unwrap().take();
+    let Some(pending) = pending else {
+        return;
+    };
+    *INPUT_TEXT.lock().unwrap() = (Some(pending.id), Some(text.trim().to_owned()));
+}
+
+/// 自绘输入框点了「取消」（或按了 Esc）：报告被取消的请求 id，并清掉输入槽。
+pub fn cancel_pending_input() {
+    let pending = PENDING_INPUT.lock().unwrap().take();
+    let Some(pending) = pending else {
+        return;
+    };
+    *INPUT_CANCELLED.lock().unwrap() = Some(pending.id);
+    *INPUT_TEXT.lock().unwrap() = (None, None);
+}
+
+pub fn take_input() -> Option<(String, String)> {
+    let mut w = INPUT_TEXT.lock().unwrap();
+    w.0.clone().zip(std::mem::take(&mut w.1))
+}
+
+/// Returns the id of a cancelled input request once, clearing it.
+pub fn take_input_cancelled() -> Option<String> {
+    INPUT_CANCELLED.lock().unwrap().take()
+}
+
+pub fn return_input(id: String, text: String) {
+    *INPUT_TEXT.lock().unwrap() = (Some(id), Some(text));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn request_file(id: impl Into<String>) {
+    let id: String = id.into();
+    #[cfg(target_env = "ohos")]
+    let is_photo = id == "avatar";
+    *CHOSEN_FILE.lock().unwrap() = (Some(id), None);
+    cfg_if! {
+        if #[cfg(target_os = "android")] {
+            unsafe {
+                let env = miniquad::native::attach_jni_env();
+                let ctx = ndk_context::android_context().context();
+                let class = (**env).GetObjectClass.unwrap()(env, ctx);
+                let method = (**env).GetMethodID.unwrap()(env, class, c"chooseFile".as_ptr() as _, c"()V".as_ptr() as _);
+                (**env).CallVoidMethod.unwrap()(env, ctx, method);
+            }
+        } else if #[cfg(target_os = "ios")] {
+            use objc2::{available, define_class, rc::Retained, runtime::ProtocolObject, MainThreadMarker, MainThreadOnly};
+            use objc2_foundation::{NSArray, NSObject, NSObjectProtocol, NSString, NSURL};
+            use objc2_ui_kit::{UIDocumentPickerDelegate, UIDocumentPickerViewController};
+
+            thread_local! {
+                static DELEGATE: RefCell<Option<Retained<PickerDelegate>>> = const { RefCell::new(None) };
+            }
+
+            define_class! {
+                // SAFETY:
+                // - The superclass NSObject does not have any subclassing requirements.
+                // - `Delegate` does not implement `Drop`.
+                #[unsafe(super = NSObject)]
+                #[thread_kind = MainThreadOnly]
+                struct PickerDelegate;
+
+                // SAFETY: `NSObjectProtocol` has no safety requirements.
+                unsafe impl NSObjectProtocol for PickerDelegate {}
+
+                // SAFETY: `UIDocumentPickerDelegate` has no safety requirements.
+                unsafe impl UIDocumentPickerDelegate for PickerDelegate {
+                    // SAFETY: The signature is correct.
+                    #[unsafe(method(documentPicker:didPickDocumentsAtURLs:))]
+                    fn did_pick_documents_at_urls(&self, controller: &UIDocumentPickerViewController, urls: &NSArray<NSURL>) {
+                        use objc2_foundation::{NSData, NSDataReadingOptions, NSTemporaryDirectory};
+
+                        let url = urls.firstObject().unwrap();
+                        let need_close = unsafe { url.startAccessingSecurityScopedResource() };
+
+                        let data = match NSData::dataWithContentsOfURL_options_error(&url, NSDataReadingOptions::Uncached) {
+                            Ok(data) => data,
+                            Err(err) => {
+                                let message = err.localizedDescription().to_string();
+                                show_error(Error::msg(message).context(ttl!("read-file-failed")));
+                                return;
+                            }
+                        };
+                        if need_close {
+                            unsafe { url.stopAccessingSecurityScopedResource() };
+                        }
+
+                        let dir = NSTemporaryDirectory();
+                        let path = format!("{}{}", dir, uuid::Uuid::new_v4());
+                        data.writeToFile_atomically(&NSString::from_str(&path), true);
+                        CHOSEN_FILE.lock().unwrap().1 = Some(path);
+                    }
+                }
+            }
+
+            impl PickerDelegate {
+                fn new(mtm: MainThreadMarker) -> Retained<Self> {
+                    let this = Self::alloc(mtm).set_ivars(());
+                    unsafe { objc2::msg_send![super(this), init] }
+                }
+            }
+
+            let mtm = MainThreadMarker::new().unwrap();
+
+            let picker = UIDocumentPickerViewController::alloc(mtm);
+            let picker = if available!(ios = 14.0.0) {
+                use objc2_uniform_type_identifiers::UTType;
+
+                let ext = |e: &str| UTType::typeWithFilenameExtension(&NSString::from_str(e)).unwrap();
+                let types = NSArray::from_retained_slice(&[
+                    ext("zip"),
+                    ext("pez"),
+                    ext("jpg"),
+                    ext("png"),
+                    ext("jpeg"),
+                    ext("bmp"),
+                    ext("webp"),
+                    ext("json"),
+                    ext("mp3"),
+                    ext("ogg"),
+                    // 自定义字体 / 立绘导入
+                    ext("ttf"),
+                    ext("otf"),
+                    ext("ttc"),
+                ]);
+                UIDocumentPickerViewController::initForOpeningContentTypes(picker, &types)
+            } else {
+                #[allow(deprecated)]
+                {
+                    use objc2_ui_kit::UIDocumentPickerMode;
+
+                    let ext = NSString::from_str;
+                    let types = NSArray::from_retained_slice(&[ext("public.image"), ext("public.archive")]);
+                    UIDocumentPickerViewController::initWithDocumentTypes_inMode(picker, &types, UIDocumentPickerMode::Import)
+                }
+            };
+            let dlg_obj = PickerDelegate::new(mtm);
+            picker.setDelegate(Some(ProtocolObject::from_ref(&*dlg_obj)));
+            DELEGATE.with(|it| *it.borrow_mut() = Some(dlg_obj));
+
+            inputbox::backend::IOS::get_top_view_controller(mtm)
+                .unwrap()
+                .presentViewController_animated_completion(&picker, true, None);
+        } else if #[cfg(target_env = "ohos")] {
+            miniquad::native::call_request_callback(format!(r#"{{"action": "chooseFile", "isPhoto": {}}}"#, is_photo));
+        } else { // desktop
+            CHOSEN_FILE.lock().unwrap().1 = rfd::FileDialog::new().pick_file().map(|it| it.display().to_string());
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn take_file() -> Option<(String, String)> {
+    let mut w = CHOSEN_FILE.lock().unwrap();
+    w.0.clone().zip(std::mem::take(&mut w.1))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn return_file(id: String, file: String) {
+    *CHOSEN_FILE.lock().unwrap() = (Some(id), Some(file));
+}
+
+pub trait Scene {
+    fn enter(&mut self, _tm: &mut TimeManager, _target: Option<RenderTarget>) -> Result<()> {
+        Ok(())
+    }
+    fn pause(&mut self, _tm: &mut TimeManager) -> Result<()> {
+        Ok(())
+    }
+    fn resume(&mut self, _tm: &mut TimeManager) -> Result<()> {
+        Ok(())
+    }
+    fn on_result(&mut self, _tm: &mut TimeManager, _result: Box<dyn Any>) -> Result<()> {
+        Ok(())
+    }
+    fn touch(&mut self, _tm: &mut TimeManager, _touch: &Touch) -> Result<bool> {
+        Ok(false)
+    }
+    fn update(&mut self, tm: &mut TimeManager) -> Result<()>;
+    fn render(&mut self, tm: &mut TimeManager, ui: &mut Ui) -> Result<()>;
+    fn next_scene(&mut self, _tm: &mut TimeManager) -> NextScene {
+        NextScene::None
+    }
+}
+
+pub trait RenderTargetChooser {
+    fn choose(&mut self) -> Option<RenderTarget>;
+}
+impl RenderTargetChooser for Option<RenderTarget> {
+    fn choose(&mut self) -> Option<RenderTarget> {
+        *self
+    }
+}
+impl<F: FnMut() -> Option<RenderTarget>> RenderTargetChooser for F {
+    fn choose(&mut self) -> Option<RenderTarget> {
+        self()
+    }
+}
+
+pub struct Main {
+    pub scenes: Vec<Box<dyn Scene>>,
+    times: Vec<f64>,
+    target_chooser: Box<dyn RenderTargetChooser>,
+    tm: TimeManager,
+    paused: bool,
+    last_update_time: f64,
+    should_exit: bool,
+    pub top_level: bool,
+    touches: Option<Vec<Touch>>,
+    pub viewport: Option<(i32, i32, i32, i32)>,
+}
+
+impl Main {
+    pub async fn new(mut scene: Box<dyn Scene>, mut tm: TimeManager, mut target_chooser: impl RenderTargetChooser + 'static) -> Result<Self> {
+        simulate_mouse_with_touch(false);
+        scene.enter(&mut tm, target_chooser.choose())?;
+        let last_update_time = tm.now();
+        macro_rules! load_tex {
+            ($path:literal) => {
+                SafeTexture::from(Texture2D::from_image(&load_image($path).await?))
+            };
+        }
+        let icons = [load_tex!("info.png"), load_tex!("warn.png"), load_tex!("ok.png"), load_tex!("error.png")];
+        BILLBOARD.with(|it| it.borrow_mut().0.set_icons(icons));
+        Ok(Self {
+            scenes: vec![scene],
+            times: Vec::new(),
+            target_chooser: Box::new(target_chooser),
+            tm,
+            paused: false,
+            last_update_time,
+            should_exit: false,
+            top_level: true,
+            touches: None,
+            viewport: None,
+        })
+    }
+
+    pub fn update(&mut self) -> Result<()> {
+        self.update_with_mutate(|_| {})
+    }
+
+    pub fn update_with_mutate(&mut self, f: impl Fn(&mut Touch)) -> Result<()> {
+        if self.paused {
+            return Ok(());
+        }
+        match self.scenes.last_mut().unwrap().next_scene(&mut self.tm) {
+            NextScene::None => {}
+            NextScene::Pop => {
+                self.scenes.pop();
+                self.tm.seek_to(self.times.pop().unwrap());
+                self.scenes.last_mut().unwrap().enter(&mut self.tm, self.target_chooser.choose())?;
+            }
+            NextScene::PopN(num) => {
+                for _ in 0..num {
+                    self.scenes.pop();
+                    self.tm.seek_to(self.times.pop().unwrap());
+                }
+                self.scenes.last_mut().unwrap().enter(&mut self.tm, self.target_chooser.choose())?;
+            }
+            NextScene::PopWithResult(result) => {
+                self.scenes.pop();
+                self.tm.seek_to(self.times.pop().unwrap());
+                self.scenes.last_mut().unwrap().on_result(&mut self.tm, result)?;
+                self.scenes.last_mut().unwrap().enter(&mut self.tm, self.target_chooser.choose())?;
+            }
+            NextScene::PopNWithResult(num, result) => {
+                for _ in 0..num {
+                    self.scenes.pop();
+                    self.tm.seek_to(self.times.pop().unwrap());
+                }
+                self.scenes.last_mut().unwrap().on_result(&mut self.tm, result)?;
+                self.scenes.last_mut().unwrap().enter(&mut self.tm, self.target_chooser.choose())?;
+            }
+            NextScene::Exit => {
+                self.should_exit = true;
+            }
+            NextScene::Overlay(mut scene) => {
+                self.times.push(self.tm.now());
+                scene.enter(&mut self.tm, self.target_chooser.choose())?;
+                self.scenes.push(scene);
+            }
+            NextScene::Replace(mut scene) => {
+                scene.enter(&mut self.tm, self.target_chooser.choose())?;
+                *self.scenes.last_mut().unwrap() = scene;
+            }
+        }
+        Judge::on_new_frame();
+        let mut touches = Judge::get_touches();
+        touches.iter_mut().for_each(f);
+        if !(touches.is_empty() || FULL_LOADING.with(|it| it.borrow().is_some())) {
+            let now = self.tm.now();
+            let delta = (now - self.last_update_time) / touches.len() as f64;
+            let start_time = self.tm.start_time;
+            let mut last_err = None;
+            DIALOG.with(|it| -> Result<()> {
+                let mut index = 1;
+                touches.retain_mut(|touch| {
+                    let t = self.last_update_time + (index + 1) as f64 * delta;
+                    index += 1;
+                    // 自绘输入框挂着时：**模态拦截** —— 触摸不派发给场景。
+                    //
+                    // ⚠️ 必须在这里（引擎层）拦，不能只在 `MainScene::touch` 里拦：
+                    // 输入框的绘制回调挂在 `Main::render` 的 `top_level`（对所有场景生效），
+                    // 而 `MainScene::touch` 只有栈顶是 `MainScene` 时才被调用。
+                    // 栈顶是独立场景时（`GameScene` 的练习模式时间输入、
+                    // `SongScene` 的举报理由 / 稳定度评论、`ProfileScene` 的转移邮箱）
+                    // 原来**没有任何拦截** —— 点「确定 / 取消 / 退格 / 清空」这一下会
+                    // 同时打到输入框**和**底下的场景，等于穿透。
+                    //
+                    // 返回 `false` = **保留**这个触摸在列表里（`retain_mut` 的语义是
+                    // `false` 保留）：场景收不到，但 `ui.touches()` 仍然读得到，
+                    // 输入框自己的按钮命中就靠它。和上面 `DIALOG` 分支同一套写法。
+                    if has_pending_input() {
+                        return false;
+                    }
+                    let mut guard = it.borrow_mut();
+                    if let Some(dialog) = guard.as_mut() {
+                        if !dialog.touch(touch, t as _) {
+                            drop(guard);
+                            *it.borrow_mut() = None;
+                        }
+                        false
+                    } else {
+                        drop(guard);
+                        self.tm.seek_to(t);
+                        match self.scenes.last_mut().unwrap().touch(&mut self.tm, touch) {
+                            Ok(val) => !val,
+                            Err(err) => {
+                                warn!(?err, "failed to handle touch");
+                                last_err = Some(err);
+                                false
+                            }
+                        }
+                    }
+                });
+                Ok(())
+            })?;
+            if let Some(err) = last_err {
+                return Err(err);
+            }
+            self.tm.start_time = start_time;
+        }
+        self.touches = Some(touches);
+        self.last_update_time = self.tm.now();
+        DIALOG.with(|it| {
+            if let Some(dialog) = it.borrow_mut().as_mut() {
+                dialog.update(self.last_update_time as _);
+            }
+        });
+        self.scenes.last_mut().unwrap().update(&mut self.tm)?;
+        Ok(())
+    }
+
+    pub fn render(&mut self, painter: &mut TextPainter) -> Result<()> {
+        if self.paused {
+            return Ok(());
+        }
+        let mut ui = Ui::new(painter, self.viewport);
+        ui.set_touches(self.touches.take().unwrap());
+        ui.scope(|ui| self.scenes.last_mut().unwrap().render(&mut self.tm, ui))?;
+        if self.top_level {
+            push_camera_state();
+            set_camera(&ui.camera());
+            let mut gl = unsafe { get_internal_gl() };
+            gl.flush();
+            // gl.quad_gl.render_pass(None);
+            // gl.quad_gl.viewport(None);
+            BILLBOARD.with(|it| {
+                let mut guard = it.borrow_mut();
+                let t = guard.1.now() as f32;
+                guard.0.render(&mut ui, t);
+            });
+            DIALOG.with(|it| {
+                if let Some(dialog) = it.borrow_mut().as_mut() {
+                    dialog.render(&mut ui, self.tm.now() as _);
+                }
+            });
+            // 自绘文本输入框：刻意放在这里（引擎层、`top_level` 分支），而不是某个
+            // 上层页面里 —— 这样**任何**场景在栈顶时请求的输入都会被画出来。
+            // 具体理由见 `set_input_dialog_renderer` 的注释。
+            if has_pending_input() {
+                if let Some(render) = *INPUT_DIALOG_RENDERER.lock().unwrap() {
+                    render(&mut ui, self.tm.now() as f32);
+                }
+            }
+            let remove = FULL_LOADING.with(|it| {
+                if let Some(loading) = it.borrow_mut().as_mut() {
+                    if Arc::strong_count(&loading.keep_alive) > 1 {
+                        if let Some(text) = loading.text.as_ref() {
+                            ui.full_loading(text.clone(), self.tm.now() as _);
+                        } else {
+                            ui.full_loading_simple(self.tm.now() as _);
+                        }
+                        return false;
+                    } else {
+                        return true;
+                    }
+                }
+                false
+            });
+            if remove {
+                FULL_LOADING.take();
+            }
+            pop_camera_state();
+        }
+        Ok(())
+    }
+
+    pub fn pause(&mut self) -> Result<()> {
+        self.paused = true;
+        self.scenes.last_mut().unwrap().pause(&mut self.tm)
+    }
+
+    pub fn resume(&mut self) -> Result<()> {
+        self.paused = false;
+        self.scenes.last_mut().unwrap().resume(&mut self.tm)
+    }
+
+    pub fn should_exit(&self) -> bool {
+        self.should_exit
+    }
+}
+
+fn draw_background(tex: Texture2D) {
+    let asp = screen_aspect();
+    let top = 1. / asp;
+    draw_image(tex, Rect::new(-1., -top, 2., top * 2.), ScaleType::CropCenter);
+    draw_rectangle(-1., -top, 2., top * 2., Color::new(0., 0., 0., 0.3));
+}
+
+/// The rect a chart illustration occupies when laid out in the classic (prpr)
+/// parallelogram style, centered on `(x, y)`. `w` and `h` scale it.
+pub(crate) fn illustration_rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
+    const SCALE: f32 = 0.076;
+    let w = SCALE * 13. * w;
+    let h = SCALE * 7. * h;
+    Rect::new(x - w / 2., y - h / 2., w, h)
+}
+
+/// Draws an image as a skewed parallelogram (cropped to fill the rect), and
+/// returns the rect it has been drawn into.
+pub(crate) fn draw_illustration(tex: Texture2D, x: f32, y: f32, w: f32, h: f32, color: Color) -> Rect {
+    let r = illustration_rect(x, y, w, h);
+    let tr = {
+        let exp = r.w / r.h;
+        let act = tex.width() / tex.height();
+        if exp > act {
+            let h = act / exp;
+            Rect::new(0., 0.5 - h / 2., 1., h)
+        } else {
+            let w = exp / act;
+            Rect::new(0.5 - w / 2., 0., w, 1.)
+        }
+    };
+    draw_parallelogram(r, Some((tex, tr)), color, true);
+    r
+}
+
+pub type LocalSceneTask = LocalTask<Result<NextScene>>;
